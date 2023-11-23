@@ -1,1 +1,11 @@
 /target
+
+failed_chunks/
+
+out.csv
+
+Cargo.lock
+
+TVACTest-fixed.txt
+
+TVACTest-original.txt
