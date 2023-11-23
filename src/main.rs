@@ -1,6 +1,7 @@
 #![feature(iter_next_chunk)]
 
 use anyhow::{Result, anyhow, bail};
+use serde::ser::SerializeStruct;
 use std::fs::File;
 use std::io::{BufReader, BufRead};
 use csv::WriterBuilder;
@@ -10,9 +11,9 @@ const EMISSION_LINES: usize = 33;
 const DEPLOYMENT_LINES: usize = 13;
 const PAYLOAD_OFF_LINES: usize = 11;
 
-const TVAC_EMISSION: Tvac = Tvac{packet_size: EMISSION_LINES, state: TvacState::Emission};
-const TVAC_DEPLOYMENT: Tvac = Tvac{packet_size: DEPLOYMENT_LINES, state: TvacState::Deployment};
-const TVAC_PAYLOAD_OFF: Tvac = Tvac{packet_size: PAYLOAD_OFF_LINES, state: TvacState::PayloadOff};
+const TVAC_EMISSION: Tvac = Tvac{packet_size: EMISSION_LINES, state: PayloadState::Emission};
+const TVAC_DEPLOYMENT: Tvac = Tvac{packet_size: DEPLOYMENT_LINES, state: PayloadState::Deployment};
+const TVAC_PAYLOAD_OFF: Tvac = Tvac{packet_size: PAYLOAD_OFF_LINES, state: PayloadState::PayloadOff};
 
 fn main() -> Result<()>{
 	// Open text file
@@ -63,8 +64,36 @@ fn main() -> Result<()>{
 	}
 	// Do something with v
 	//println!("{v:?}");
-	let mut wtr = WriterBuilder::new().has_headers(true).flexible(true).from_path("out.csv")?;
+	let mut wtr = WriterBuilder::new().has_headers(false).flexible(true).from_path("out.csv")?;
 
+	wtr.write_record([
+		"Payload state", 
+		"Total time (s)", 
+		"Phase time (s)", 
+		"LMS emitter temp (°C)",
+		"LMS receiver temp (°C)",
+		"MSP temp (°C)",
+		"Heater temp (°C)",
+		"HVDC supply temp (°C)",
+		"Tether monitoring temp (°C)",
+		"Tether connector temp (°C)",
+		"MSP 3V3 supply temp (°C)",
+		"Pinpuller current (mA)",
+		"Pinpuller accuracy (%)",
+		"Cathode offset voltage (mV)",
+		"Cathode offset current (uA)",
+		"Cathode offset voltage accuracy (%)",
+		"Cathode offset current accuracy (%)",
+		"Tether bias voltage (mV)",
+		"Tether bias current (uA)",
+		"Tether bias voltage accuracy (%)",
+		"Tether bias current accuracy (%)",
+		"Heater voltage (mV)",
+		"Heater current (mA)",
+		"Heater voltage accuracy (%)",
+		"Heater current accuracy (%)",
+		"Repeller voltage (mV)",
+		"Repeller voltage accuracy (%)",])?;
 	for record in v {
 		wtr.serialize(record)?;
 	}
@@ -72,6 +101,8 @@ fn main() -> Result<()>{
 	println!("Written to out.csv");
 	Ok(())
 }
+
+
 
 fn write_broken_chunk_to_file(chunk: Vec<String>) {
 	static mut FILE_NUM: u32 = 0;
@@ -100,32 +131,38 @@ fn state_change(str: &str) -> Option<Tvac> {
 
 fn interpret_payload_off_packet(arr: [String;11]) -> Result<SensorData> {
 	Ok(
-		SensorData::PayloadOff(
-			extract_time(&arr[0..2])?,
-			extract_temperatures(&arr[2..10])?,
-		)
+		SensorData {
+			time: extract_time(&arr[0..2])?,
+			temperatures: extract_temperatures(&arr[2..10])?,
+			state: PayloadState::PayloadOff,
+			tether: None,
+			pinpuller: None,
+		}
 	)
 }
 
 fn interpret_deployment_packet(arr: [String;13]) -> Result<SensorData> {
 	Ok(
-		SensorData::Deployment(
-			extract_time(&arr[0..2])?,
-			extract_temperatures(&arr[4..12])?,
-			Pinpuller {
+		SensorData{
+			time: extract_time(&arr[0..2])?,
+			temperatures: extract_temperatures(&arr[4..12])?,
+			state: PayloadState::Deployment,
+			pinpuller: Some( Pinpuller {
 				current: extract_measurement_from_nth_word(&arr[2], 3, "mA")?,
 				acc: extract_measurement_from_nth_word(&arr[3], 3, "%")?
-			},
-		)
+			}),
+			tether: None,
+		}
 	)
 }
 
 fn interpret_emission_packet(arr: [String; 33]) -> Result<SensorData> {
 	Ok(
-		SensorData::Emission(
-			extract_time(&arr[0..2])?,
-			extract_temperatures(&arr[25..33])?,
-			TetherSensors {
+		SensorData {
+			time: extract_time(&arr[0..2])?,
+			temperatures: extract_temperatures(&arr[25..33])?,
+			state: PayloadState::Emission,
+			tether: Some(TetherSensors {
 				cathode_offset: CathodeOffsetSupply {
 					voltage: extract_measurement_from_nth_word(&arr[2], 3, "mV")?,
 					current: extract_measurement_from_nth_word(&arr[3], 3, "uA")?,
@@ -148,8 +185,9 @@ fn interpret_emission_packet(arr: [String; 33]) -> Result<SensorData> {
 					voltage: extract_measurement_from_nth_word(&arr[22], 3, "mV")?,
 					v_acc: extract_measurement_from_nth_word(&arr[24], 2, "%")?
 				},
-			},
-		)
+			}),
+			pinpuller: None,
+		}
 	)
 }
 
@@ -212,30 +250,62 @@ where
 #[derive(Debug)]
 struct Tvac {
 	packet_size: usize,
-	state: TvacState,
+	state: PayloadState,
 }
 impl Tvac {
 	fn interpret_packet(&self, vec: Vec<String>) -> Result<SensorData>{
 		match self.state {
-			TvacState::PayloadOff => interpret_payload_off_packet(vec.try_into().map_err(|e| {eprintln!("{e:?}"); anyhow!("Failed to coerce to 11-sized arr")})?),
-			TvacState::Deployment => interpret_deployment_packet(vec.try_into().map_err(|e| {eprintln!("{e:?}"); anyhow!("Failed to coerce to 13-sized arr")})?),
-			TvacState::Emission => interpret_emission_packet(vec.try_into().map_err(|e| {eprintln!("{e:?}"); anyhow!("Failed to coerce to 33-sized arr")})?),
+			PayloadState::PayloadOff => interpret_payload_off_packet(vec.try_into().map_err(|e| {eprintln!("{e:?}"); anyhow!("Failed to coerce to 11-sized arr")})?),
+			PayloadState::Deployment => interpret_deployment_packet(vec.try_into().map_err(|e| {eprintln!("{e:?}"); anyhow!("Failed to coerce to 13-sized arr")})?),
+			PayloadState::Emission => interpret_emission_packet(vec.try_into().map_err(|e| {eprintln!("{e:?}"); anyhow!("Failed to coerce to 33-sized arr")})?),
 		}
 	}
 }
 
-#[derive(Debug)]
-enum TvacState {
+#[derive(Debug, serde::Serialize)]
+enum PayloadState {
 	PayloadOff,
 	Deployment,
 	Emission,
 }
 
-#[derive(Debug, serde::Serialize)]
-enum SensorData {
-	PayloadOff(Time, Temperatures),
-	Deployment(Time, Temperatures, Pinpuller),
-	Emission(  Time, Temperatures, TetherSensors),
+#[derive(Debug)]
+struct SensorData {
+	time: Time,
+	temperatures: Temperatures,
+	state: PayloadState,
+	pinpuller: Option<Pinpuller>,
+	tether: Option<TetherSensors>,
+}
+impl serde::Serialize for SensorData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("SensorData", 3)?;
+		state.serialize_field("state", &self.state)?;
+        state.serialize_field("time", &self.time)?;
+		state.serialize_field("temperatures", &self.temperatures)?;
+		match &self.pinpuller {
+			Some(p) => state.serialize_field("pinpuller", &p),
+			None => {
+				state.serialize_field("current", &None::<Pinpuller>)?;
+				state.serialize_field("acc", &None::<Pinpuller>)?;
+				Ok(())
+			}
+		}?;
+		match &self.tether {
+			Some(t) => state.serialize_field("tether", &t),
+			None => {
+				state.serialize_field("cathode_offset", &None::<CathodeOffsetSupply>)?;
+				state.serialize_field("tether_bias", &None::<TetherBiasSupply>)?;
+				state.serialize_field("heater", &None::<HeaterSupply>)?;
+				state.serialize_field("repeller", &None::<Repeller>)?;
+				Ok(())
+			}
+		}?;
+        state.end()
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
